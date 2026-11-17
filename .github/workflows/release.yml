@@ -1,0 +1,73 @@
+name: Build and release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create releases
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
+      WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Mozilla refuses to sign the same version twice, so every run gets a
+      # unique version: major.minor from manifest.json + the CI run number.
+      - name: Set version
+        id: version
+        run: |
+          VERSION=$(node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            const [major, minor] = m.version.split(".");
+            m.version = `${major}.${minor ?? 0}.${process.env.GITHUB_RUN_NUMBER}`;
+            fs.writeFileSync("manifest.json", JSON.stringify(m, null, 2) + "\n");
+            console.log(m.version);
+          ')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - run: npm run lint
+
+      - name: Sign with Mozilla
+        if: env.WEB_EXT_API_KEY != ''
+        run: npm run sign
+
+      - name: Build unsigned (no API keys configured)
+        if: env.WEB_EXT_API_KEY == ''
+        run: |
+          echo "::warning::WEB_EXT_API_KEY / WEB_EXT_API_SECRET secrets not set; release will be UNSIGNED."
+          npx web-ext build --overwrite-dest --filename "yt-preview-handoff-${{ steps.version.outputs.version }}.xpi"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yt-preview-handoff-${{ steps.version.outputs.version }}
+          path: dist/*.xpi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*.xpi
+          body: |
+            ${{ env.WEB_EXT_API_KEY != '' && 'Signed by Mozilla, ready to install: download the `.xpi` and drag it into Firefox.' || '**Unsigned build**: only installable as a temporary add-on via `about:debugging`.' }}
+
+            Commit: ${{ github.sha }}

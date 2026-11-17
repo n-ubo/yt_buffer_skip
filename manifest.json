@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "YT Preview Handoff",
+  "version": "1.0.0",
+  "description": "Keeps the hover preview playing until the real YouTube player is ready, then hands off at the same timestamp.",
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"],
+      "js": ["main.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "yt-preview-handoff@renzo.local",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": { "required": ["none"] }
+    },
+    "gecko_android": {
+      "strict_min_version": "128.0"
+    }
+  }
+}
