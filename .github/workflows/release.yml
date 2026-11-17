@@ -19,9 +19,9 @@ jobs:
       WEB_EXT_API_KEY: ${{ secrets.WEB_EXT_API_KEY }}
       WEB_EXT_API_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -48,7 +48,11 @@ jobs:
 
       - name: Sign with Mozilla
         if: env.WEB_EXT_API_KEY != ''
-        run: npm run sign
+        # Strip stray whitespace/newlines that sneak in when pasting secrets.
+        run: |
+          export WEB_EXT_API_KEY="$(printf '%s' "$WEB_EXT_API_KEY" | tr -d '[:space:]')"
+          export WEB_EXT_API_SECRET="$(printf '%s' "$WEB_EXT_API_SECRET" | tr -d '[:space:]')"
+          npm run sign
 
       - name: Build unsigned (no API keys configured)
         if: env.WEB_EXT_API_KEY == ''
