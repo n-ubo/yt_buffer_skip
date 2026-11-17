@@ -1,4 +1,15 @@
-// YT Preview Handoff — paste into the console on youtube.com.
+// ==UserScript==
+// @name         YT Preview Handoff
+// @namespace    yt-preview-handoff
+// @version      1.0.0
+// @description  Keeps the hover preview playing until the real YouTube player is ready, then hands off at the same timestamp.
+// @match        https://www.youtube.com/*
+// @match        https://m.youtube.com/*
+// @run-at       document-idle
+// @grant        none
+// @inject-into  page
+// ==/UserScript==
+
 // Keeps the hover preview playing over the watch page until the real player
 // is ready, then hands off at the same timestamp.
 
