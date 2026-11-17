@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Preview Handoff
 // @namespace    yt-preview-handoff
-// @version      1.1.0
+// @version      1.2.0
 // @description  Keeps the hover preview playing until the real YouTube player is ready, then hands off at the same timestamp.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -275,15 +275,44 @@
     pending = null;
   }
 
+  // Fake a real mouse resting on the thumbnail. On touch devices the browser's
+  // emulated hover is tagged as touch, and YouTube doesn't start previews for it.
+  function fakeHover(x, y, enter) {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return;
+    const base = { clientX: x, clientY: y, view: window, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    const fire = (node, type, bubbles) => {
+      const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+      node.dispatchEvent(new Ctor(type, { ...base, bubbles, cancelable: bubbles, composed: true }));
+    };
+    if (enter) {
+      fire(el, 'pointerover', true);
+      fire(el, 'mouseover', true);
+      // enter events don't bubble: fire them on every ancestor, outermost first
+      const chain = [];
+      for (let n = el; n && n !== document.documentElement; n = n.parentElement) chain.unshift(n);
+      for (const n of chain) { fire(n, 'pointerenter', false); fire(n, 'mouseenter', false); }
+    }
+    fire(el, 'pointermove', true);
+    fire(el, 'mousemove', true);
+  }
+
   function waitForPreview(a, x, y) {
     const root = document.documentElement;
-    pending = { a, x, y, raf: 0, t0: performance.now(), prevCursor: root.style.cursor };
+    const touch = performance.now() - lastThumbTouch < 1000;
+    pending = { a, x, y, raf: 0, t0: performance.now(), prevCursor: root.style.cursor, touch, lastMove: 0 };
     root.style.cursor = 'progress';
-    log('early click, waiting for preview');
+    log('early click, waiting for preview', touch ? '(touch)' : '');
+    if (touch) fakeHover(x, y, true);
 
     const loop = () => {
       if (!pending) return;
       const p = pending;
+      // keep "moving the mouse" so YouTube's hover-delay timer keeps running
+      if (p.touch && performance.now() - p.lastMove > 200) {
+        p.lastMove = performance.now();
+        fakeHover(p.x, p.y, false);
+      }
       const v = findPreviewVideo(p.x, p.y);
       if (v && v.currentTime > 0.1) {
         log('preview started, navigating');
@@ -319,9 +348,13 @@
     return !!a && onThumbnail({ target: el, clientX: t.clientX, clientY: t.clientY }, a);
   };
 
+  let lastThumbTouch = -Infinity;
+
   for (const type of ['touchstart', 'touchend']) {
     window.addEventListener(type, (e) => {
-      if (isThumbTouch(e)) e.stopImmediatePropagation();
+      if (!isThumbTouch(e)) return;
+      e.stopImmediatePropagation();
+      if (type === 'touchend') lastThumbTouch = performance.now();
     }, { capture: true, passive: true });
   }
 
