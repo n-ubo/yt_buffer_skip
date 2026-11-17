@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Preview Handoff
 // @namespace    yt-preview-handoff
-// @version      1.0.0
+// @version      1.1.0
 // @description  Keeps the hover preview playing until the real YouTube player is ready, then hands off at the same timestamp.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -301,6 +301,28 @@
       p.raf = requestAnimationFrame(loop);
     };
     pending.raf = requestAnimationFrame(loop);
+  }
+
+  // ---------- touch ----------
+
+  // On touch, YouTube navigates straight from its own touch handlers (before any
+  // click), so the preview never gets a chance. Hide touches on thumbnails from
+  // YouTube: the browser then sends its emulated mouse events (hover -> preview
+  // starts) and a click, and the normal mouse flow below takes over.
+  const isThumbTouch = (e) => {
+    if (e.touches && e.touches.length > 1) return false;
+    const t = e.changedTouches?.[0];
+    const el = e.target;
+    if (!t || !el.closest) return false;
+    if (el.closest('button, [role="button"], .ytp-button, yt-icon-button')) return false;
+    const a = el.closest('a[href*="/watch"]');
+    return !!a && onThumbnail({ target: el, clientX: t.clientX, clientY: t.clientY }, a);
+  };
+
+  for (const type of ['touchstart', 'touchend']) {
+    window.addEventListener(type, (e) => {
+      if (isThumbTouch(e)) e.stopImmediatePropagation();
+    }, { capture: true, passive: true });
   }
 
   // ---------- events ----------
