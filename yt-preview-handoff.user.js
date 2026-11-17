@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         YT Preview Handoff
 // @namespace    yt-preview-handoff
-// @version      1.2.0
+// @version      1.3.0
 // @description  Keeps the hover preview playing until the real YouTube player is ready, then hands off at the same timestamp.
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
 // @run-at       document-idle
+// @noframes
 // @grant        none
 // @inject-into  page
 // @downloadURL  https://raw.githubusercontent.com/n-ubo/yt_buffer_skip/master/yt-preview-handoff.user.js
@@ -231,6 +232,14 @@
 
     if (s.mutedMain && !s.mainWasMuted) mainPlayer()?.unMute?.();
 
+    // Our own inserted preview (touch): nothing to give back, just remove it.
+    if (s.kind === 'feed') {
+      s.box.remove();
+      log('cleaned up feed preview', revert ? '(reverted)' : '');
+      schedulePick();
+      return;
+    }
+
     if (revert) {
       MUTED.set.call(s.v, s.origMuted);
     } else {
@@ -275,44 +284,15 @@
     pending = null;
   }
 
-  // Fake a real mouse resting on the thumbnail. On touch devices the browser's
-  // emulated hover is tagged as touch, and YouTube doesn't start previews for it.
-  function fakeHover(x, y, enter) {
-    const el = document.elementFromPoint(x, y);
-    if (!el) return;
-    const base = { clientX: x, clientY: y, view: window, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-    const fire = (node, type, bubbles) => {
-      const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
-      node.dispatchEvent(new Ctor(type, { ...base, bubbles, cancelable: bubbles, composed: true }));
-    };
-    if (enter) {
-      fire(el, 'pointerover', true);
-      fire(el, 'mouseover', true);
-      // enter events don't bubble: fire them on every ancestor, outermost first
-      const chain = [];
-      for (let n = el; n && n !== document.documentElement; n = n.parentElement) chain.unshift(n);
-      for (const n of chain) { fire(n, 'pointerenter', false); fire(n, 'mouseenter', false); }
-    }
-    fire(el, 'pointermove', true);
-    fire(el, 'mousemove', true);
-  }
-
   function waitForPreview(a, x, y) {
     const root = document.documentElement;
-    const touch = performance.now() - lastThumbTouch < 1000;
-    pending = { a, x, y, raf: 0, t0: performance.now(), prevCursor: root.style.cursor, touch, lastMove: 0 };
+    pending = { a, x, y, raf: 0, t0: performance.now(), prevCursor: root.style.cursor };
     root.style.cursor = 'progress';
-    log('early click, waiting for preview', touch ? '(touch)' : '');
-    if (touch) fakeHover(x, y, true);
+    log('early click, waiting for preview');
 
     const loop = () => {
       if (!pending) return;
       const p = pending;
-      // keep "moving the mouse" so YouTube's hover-delay timer keeps running
-      if (p.touch && performance.now() - p.lastMove > 200) {
-        p.lastMove = performance.now();
-        fakeHover(p.x, p.y, false);
-      }
       const v = findPreviewVideo(p.x, p.y);
       if (v && v.currentTime > 0.1) {
         log('preview started, navigating');
@@ -332,12 +312,157 @@
     pending.raf = requestAnimationFrame(loop);
   }
 
-  // ---------- touch ----------
+  // ---------- touch: our own feed preview ----------
 
-  // On touch, YouTube navigates straight from its own touch handlers (before any
-  // click), so the preview never gets a chance. Hide touches on thumbnails from
-  // YouTube: the browser then sends its emulated mouse events (hover -> preview
-  // starts) and a click, and the normal mouse flow below takes over.
+  // YouTube never starts hover previews on touch devices, so we make our own:
+  // when scrolling stops, the thumbnail nearest the middle of the screen gets a
+  // muted embed player on top of it. Tapping it hands that player off exactly
+  // like a desktop hover preview.
+
+  const IS_TOUCH = matchMedia('(hover: none), (pointer: coarse)').matches;
+  const PICK_DELAY_MS = 400; // wait this long after scrolling stops before picking
+
+  let feed = null; // { a, img, id, box, iframe, video, raf }
+  let pickTimer = 0;
+
+  const videoId = (a) => {
+    try { return new URL(a.href).searchParams.get('v'); } catch { return null; }
+  };
+
+  // Thumbnail fully on screen whose centre is closest to the middle of the screen.
+  function pickThumb() {
+    const vh = innerHeight;
+    let best = null;
+    let bestDist = Infinity;
+    for (const a of document.querySelectorAll('a[href*="/watch"]')) {
+      const img = a.querySelector('img');
+      if (!img) continue;
+      const r = img.getBoundingClientRect();
+      if (r.width < 120 || r.height < 60) continue;
+      if (r.top < 0 || r.bottom > vh) continue;
+      const dist = Math.abs(r.top + r.height / 2 - vh / 2);
+      if (dist < bestDist) { bestDist = dist; best = { a, img }; }
+    }
+    return best;
+  }
+
+  function stopFeed() {
+    if (!feed) return;
+    cancelAnimationFrame(feed.raf);
+    feed.box.remove();
+    feed = null;
+  }
+
+  // The embed is same-origin (youtube.com), so we can reach into it.
+  const frameDoc = (f) => { try { return f.iframe.contentDocument; } catch { return null; } };
+  const isPlaying = (v) => !!v && !v.paused && v.currentTime > 0.1 && v.readyState >= 2;
+
+  function startFeed(pick) {
+    const id = videoId(pick.a);
+    if (!id || (feed && feed.id === id)) return;
+    stopFeed();
+
+    const box = document.createElement('div');
+    Object.assign(box.style, {
+      position: 'fixed',
+      zIndex: '2147483646',
+      background: '#000',
+      overflow: 'hidden',
+      borderRadius: '12px',
+      pointerEvents: 'none', // taps go through to the thumbnail underneath
+      opacity: '0',          // stay invisible until the video actually plays
+      transition: 'opacity .2s',
+    });
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://www.youtube.com/embed/${id}?autoplay=1&mute=1&controls=0&playsinline=1&rel=0&iv_load_policy=3&disablekb=1&fs=0`;
+    iframe.allow = 'autoplay; encrypted-media';
+    Object.assign(iframe.style, { border: '0', width: '100%', height: '100%', pointerEvents: 'none' });
+    box.appendChild(iframe);
+    document.body.appendChild(box);
+
+    const f = { a: pick.a, img: pick.img, id, box, iframe, video: null, raf: 0 };
+    feed = f;
+    log('feed preview', id);
+
+    // Keep the box glued to the thumbnail while it's on screen.
+    const follow = () => {
+      if (feed !== f) return;
+      const r = f.img.getBoundingClientRect();
+      if (!f.img.isConnected || r.width === 0 || r.bottom < 0 || r.top > innerHeight) return stopFeed();
+      box.style.left = r.left + 'px';
+      box.style.top = r.top + 'px';
+      box.style.width = r.width + 'px';
+      box.style.height = r.height + 'px';
+      if (!f.video?.isConnected) f.video = frameDoc(f)?.querySelector('video') || null;
+      box.style.opacity = isPlaying(f.video) ? '1' : '0';
+      f.raf = requestAnimationFrame(follow);
+    };
+    follow();
+  }
+
+  function schedulePick() {
+    if (!IS_TOUCH) return;
+    clearTimeout(pickTimer);
+    pickTimer = setTimeout(() => {
+      if (state || isWatch() || document.hidden) return stopFeed();
+      const p = pickThumb();
+      if (p) startFeed(p);
+      else stopFeed();
+    }, PICK_DELAY_MS);
+  }
+
+  // Tapped the thumbnail our preview is playing on: take it over.
+  function startFromFeed(f) {
+    cleanup(true);
+    cancelAnimationFrame(f.raf);
+    feed = null;
+
+    const v = f.video;
+    const box = f.box;
+    box.style.zIndex = '2147483647';
+    box.style.opacity = '1';
+    box.style.transition = 'left .25s ease, top .25s ease, width .25s ease, height .25s ease, border-radius .25s ease';
+
+    state = {
+      kind: 'feed',
+      v,
+      box,
+      navigated: false,
+      navAt: 0,
+      placed: false,
+      mutedMain: false,
+      mainWasMuted: false,
+      seekAt: 0,
+      raf: 0,
+      revertTimer: 0,
+    };
+
+    // We're inside the tap, so try to turn the sound on (match the main player's volume).
+    const pl = mainPlayer();
+    if (!(pl?.isMuted?.())) {
+      const vol = pl?.getVolume?.() ?? 100;
+      const ep = frameDoc(f)?.getElementById('movie_player');
+      try {
+        if (ep?.unMute) { ep.unMute(); ep.setVolume?.(vol); }
+        else { v.volume = Math.min(1, vol / 100); v.muted = false; }
+      } catch {}
+      // If the browser refused unmuted playback, fall back to muted rather than paused.
+      setTimeout(() => {
+        if (state?.v === v && v.paused) { v.muted = true; v.play().catch(() => {}); }
+      }, 300);
+    }
+
+    state.revertTimer = setTimeout(() => {
+      if (state && !state.navigated) cleanup(true);
+    }, NAV_WINDOW_MS);
+
+    log('started from feed at', v.currentTime);
+    state.raf = requestAnimationFrame(tick);
+  }
+
+  // On touch, YouTube can navigate straight from its own touch handlers, before
+  // our click handler runs. Hide touches on thumbnails from YouTube so the
+  // navigation always comes from the click.
   const isThumbTouch = (e) => {
     if (e.touches && e.touches.length > 1) return false;
     const t = e.changedTouches?.[0];
@@ -348,14 +473,17 @@
     return !!a && onThumbnail({ target: el, clientX: t.clientX, clientY: t.clientY }, a);
   };
 
-  let lastThumbTouch = -Infinity;
-
-  for (const type of ['touchstart', 'touchend']) {
-    window.addEventListener(type, (e) => {
-      if (!isThumbTouch(e)) return;
-      e.stopImmediatePropagation();
-      if (type === 'touchend') lastThumbTouch = performance.now();
-    }, { capture: true, passive: true });
+  if (IS_TOUCH) {
+    for (const type of ['touchstart', 'touchend']) {
+      window.addEventListener(type, (e) => {
+        if (isThumbTouch(e)) e.stopImmediatePropagation();
+      }, { capture: true, passive: true });
+    }
+    window.addEventListener('scroll', schedulePick, { capture: true, passive: true });
+    window.addEventListener('resize', schedulePick);
+    document.addEventListener('visibilitychange', schedulePick);
+    document.addEventListener('yt-navigate-finish', schedulePick);
+    schedulePick();
   }
 
   // ---------- events ----------
@@ -364,6 +492,15 @@
     if (bypass) return;
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
     if (e.target.closest?.('button, [role="button"], .ytp-button, yt-icon-button')) return;
+
+    // Touch: there are no YouTube previews to wait for. If our own preview is
+    // playing this video, take it over; either way let YouTube navigate normally.
+    if (IS_TOUCH) {
+      const a = e.target.closest?.('a[href*="/watch"]');
+      const f = feed;
+      if (a && f && videoId(a) === f.id && isPlaying(f.video)) startFromFeed(f);
+      return;
+    }
 
     // Preview already playing: hand it off and let the click navigate normally.
     const v = findPreviewVideo(e.clientX, e.clientY);
