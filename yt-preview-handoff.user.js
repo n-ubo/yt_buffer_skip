@@ -8,6 +8,8 @@
 // @run-at       document-idle
 // @grant        none
 // @inject-into  page
+// @downloadURL  https://raw.githubusercontent.com/n-ubo/yt_buffer_skip/master/yt-preview-handoff.user.js
+// @updateURL    https://raw.githubusercontent.com/n-ubo/yt_buffer_skip/master/yt-preview-handoff.user.js
 // ==/UserScript==
 
 // Keeps the hover preview playing over the watch page until the real player

@@ -4,17 +4,15 @@ A userscript for YouTube in Firefox. When you click a video while its hover prev
 
 Desktop YouTube only for now.
 
-## Install
+## Install (each device, once)
 
 1. Install [Violentmonkey](https://addons.mozilla.org/firefox/addon/violentmonkey/).
-2. In the Violentmonkey dashboard, click **+** → **New**.
-3. Delete the template, paste the entire contents of `main.js`, and save (Ctrl+S).
-4. Reload YouTube.
+2. Open <https://raw.githubusercontent.com/n-ubo/yt_buffer_skip/master/yt-preview-handoff.user.js> and click **Install**.
 
 ## Updating
 
-Edit `main.js`, raise `@version` in the header, then paste the file over the old script in Violentmonkey and save.
+1. Edit `yt-preview-handoff.user.js`.
+2. Raise `@version` in the header (e.g. `1.0.0` → `1.0.1`). Violentmonkey only updates when the version goes up.
+3. Push to `master`.
 
-## Other devices
-
-Violentmonkey → **Settings** → **Sync** syncs your scripts through Dropbox, OneDrive, Google Drive or WebDAV. Turn it on on each device.
+Violentmonkey checks for updates about once a day. To update right away: dashboard → **Check for updates**.
