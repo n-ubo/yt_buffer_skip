@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YT Preview Handoff
 // @namespace    yt-preview-handoff
-// @version      1.4.0
+// @version      1.5.0
 // @description  Keeps the hover preview playing until the real YouTube player is ready, then hands off at the same timestamp.
 // @match        https://www.youtube.com/*
 // @run-at       document-idle
@@ -26,14 +26,21 @@
 
   const P = HTMLMediaElement.prototype;
   const d = (k) => Object.getOwnPropertyDescriptor(P, k);
-  const SRC = d('src');
   const MUTED = d('muted');
   const VOL = d('volume');
+  // Properties YouTube's preview player must not touch while we're borrowing the video.
+  const GUARDED = ['src', 'srcObject', 'currentTime', 'muted', 'volume'].map((k) => [k, d(k)]);
 
   const NAV_WINDOW_MS = 1000;   // how long to wait for a navigation after the click
   const GIVE_UP_MS = 15000;     // max time the overlay stays up after navigating
   const SYNC_TOLERANCE = 0.35;  // seconds of drift we accept at handoff
   const PREVIEW_WAIT_MS = 2500; // early click: max wait for the preview to start before navigating anyway
+  const SNAP_MS = 200;          // how often we save the current frame (shown if the video drops out)
+  const FRAME_WAIT_MS = 1000;   // max wait for the real player to paint a frame before handing off anyway
+  const MAX_QUALITY = 'hd1080'; // highest quality we ask the preview to switch to
+
+  const QUALITY_ORDER = ['highres', 'hd2880', 'hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'];
+  const VIDEO_CSS = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
 
   let state = null;
   let pending = null; // early click waiting for the preview to start
@@ -63,13 +70,18 @@
   // Block the calls it uses to do that while we're borrowing it.
   function guard(v) {
     const noop = function () {};
+    const isSrc = (n) => String(n).toLowerCase() === 'src';
     v.pause = noop;
     v.load = noop;
     v.removeAttribute = function (n) {
-      if (String(n).toLowerCase() === 'src') return;
+      if (isSrc(n)) return;
       return Element.prototype.removeAttribute.call(this, n);
     };
-    for (const [k, desc] of [['src', SRC], ['muted', MUTED], ['volume', VOL]]) {
+    v.setAttribute = function (n, val) {
+      if (isSrc(n)) return;
+      return Element.prototype.setAttribute.call(this, n, val);
+    };
+    for (const [k, desc] of GUARDED) {
       Object.defineProperty(v, k, {
         configurable: true,
         get() { return desc.get.call(this); },
@@ -79,7 +91,69 @@
   }
 
   function unguard(v) {
-    for (const k of ['pause', 'load', 'removeAttribute', 'src', 'muted', 'volume']) delete v[k];
+    for (const k of ['pause', 'load', 'removeAttribute', 'setAttribute', ...GUARDED.map(([k]) => k)]) delete v[k];
+  }
+
+  // The preview is a small YouTube player; ask it for a sharper stream now that
+  // it's about to be shown big.
+  function previewApi(v) {
+    const pp = v.closest('.html5-video-player');
+    if (pp?.getAvailableQualityLevels) return pp;
+    return v.closest('ytd-player')?.getPlayer?.() || null;
+  }
+
+  function upgradeQuality(api) {
+    try {
+      const levels = api?.getAvailableQualityLevels?.() || [];
+      const best = QUALITY_ORDER.slice(QUALITY_ORDER.indexOf(MAX_QUALITY)).find((q) => levels.includes(q));
+      if (!best || best === api.getPlaybackQuality?.()) return;
+      api.setPlaybackQualityRange?.(best, best);
+      log('preview quality ->', best);
+    } catch {}
+  }
+
+  // Save the current frame, so if YouTube tears the preview down we show a
+  // still image instead of a black box.
+  function snapshot(s) {
+    const v = s.v;
+    if (v.readyState < 2 || !v.videoWidth) return;
+    const c = s.snap;
+    if (c.width !== v.videoWidth || c.height !== v.videoHeight) {
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+    }
+    try { c.getContext('2d').drawImage(v, 0, 0); } catch {}
+  }
+
+  function makePlayIcon() {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '40');
+    svg.setAttribute('height', '40');
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M8 5v14l11-7z');
+    path.setAttribute('fill', '#fff');
+    svg.appendChild(path);
+    const icon = document.createElement('div');
+    Object.assign(icon.style, {
+      position: 'absolute',
+      left: '50%',
+      top: '50%',
+      width: '72px',
+      height: '72px',
+      transform: 'translate(-50%, -50%)',
+      borderRadius: '50%',
+      background: 'rgba(0, 0, 0, .55)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      opacity: '0',
+      transition: 'opacity .15s',
+      pointerEvents: 'none',
+    });
+    icon.appendChild(svg);
+    return icon;
   }
 
   // ---------- lifecycle ----------
@@ -87,6 +161,7 @@
   function start(v) {
     cleanup(true);
 
+    const api = previewApi(v); // before we move it out of the player
     const rect = v.getBoundingClientRect();
     const box = document.createElement('div');
     Object.assign(box.style, {
@@ -99,22 +174,36 @@
       background: '#000',
       overflow: 'hidden',
       borderRadius: '12px',
-      pointerEvents: 'none',
+      cursor: 'pointer',
       transition: 'left .25s ease, top .25s ease, width .25s ease, height .25s ease, border-radius .25s ease',
     });
+
+    const snap = document.createElement('canvas');
+    snap.style.cssText = VIDEO_CSS + 'visibility:hidden;';
+    const icon = makePlayIcon();
 
     const pl = mainPlayer();
     state = {
       v,
       box,
+      snap,
+      icon,
+      api,
       home: { parent: v.parentNode, next: v.nextSibling, css: v.style.cssText },
       origMuted: MUTED.get.call(v),
+      css: '',
+      userPaused: false,
+      lastSnap: 0,
       navigated: false,
       navAt: 0,
       placed: false,
       mutedMain: false,
       mainWasMuted: false,
       seekAt: 0,
+      frameFor: null,
+      frameOk: false,
+      frameT0: 0,
+      frameCT: 0,
       raf: 0,
       revertTimer: 0,
     };
@@ -123,8 +212,12 @@
     // A synchronous remove+insert doesn't trigger the "paused because removed" rule,
     // so the video keeps playing through the move.
     box.appendChild(v);
+    box.appendChild(snap); // above the video, only shown when the video drops out
+    box.appendChild(icon);
     document.body.appendChild(box);
-    v.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:contain;';
+    v.style.cssText = VIDEO_CSS;
+    state.css = v.style.cssText;
+    snapshot(state);
 
     // We're inside a click, so unmuted playback is allowed.
     if (pl && pl.isMuted && !pl.isMuted()) {
@@ -132,6 +225,7 @@
       MUTED.set.call(v, false);
     }
     P.play.call(v).catch(() => {});
+    upgradeQuality(api);
 
     // Clicked something on the preview that didn't navigate (e.g. some overlay) -> give it back.
     state.revertTimer = setTimeout(() => {
@@ -140,6 +234,17 @@
 
     log('started at', v.currentTime);
     state.raf = requestAnimationFrame(tick);
+  }
+
+  function togglePause() {
+    const s = state;
+    if (!s) return;
+    s.userPaused = !s.userPaused;
+    if (s.userPaused) P.pause.call(s.v);
+    else P.play.call(s.v).catch(() => {});
+    s.icon.style.opacity = s.userPaused ? '1' : '0';
+    s.frameFor = null; // the real player has to show a frame in the new state first
+    log(s.userPaused ? 'paused' : 'resumed');
   }
 
   function place(r) {
@@ -158,9 +263,26 @@
 
   function tick() {
     if (!state) return;
+    const s = state;
+    const v = s.v;
 
-    if (state.navigated) {
-      if (performance.now() - state.navAt > GIVE_UP_MS) return cleanup();
+    // YouTube's preview player keeps restyling "its" video; keep ours.
+    if (v.style.cssText !== s.css) v.style.cssText = VIDEO_CSS;
+
+    // Show the last saved frame whenever the video has nothing to show.
+    const live = v.readyState >= 2 && v.videoWidth > 0;
+    s.snap.style.visibility = live ? 'hidden' : 'visible';
+    if (live && performance.now() - s.lastSnap > SNAP_MS) {
+      s.lastSnap = performance.now();
+      snapshot(s);
+    }
+
+    // Keep the preview in the play/pause state the user chose.
+    if (s.userPaused && !v.paused) P.pause.call(v);
+    else if (!s.userPaused && v.paused && live && !v.ended) P.play.call(v).catch(() => {});
+
+    if (s.navigated) {
+      if (performance.now() - s.navAt > GIVE_UP_MS) return cleanup();
 
       const pl = document.querySelector('ytd-watch-flexy:not([hidden]) #movie_player');
       if (pl) {
@@ -170,51 +292,80 @@
       if (tryHandoff()) return;
     }
 
-    state.raf = requestAnimationFrame(tick);
+    s.raf = requestAnimationFrame(tick);
+  }
+
+  // True once the real player has actually painted a frame at the current position,
+  // so revealing it doesn't flash black.
+  function frameShown(mv) {
+    const s = state;
+    if (s.frameFor !== mv) {
+      s.frameFor = mv;
+      s.frameOk = false;
+      s.frameT0 = performance.now();
+      s.frameCT = mv.currentTime;
+      mv.requestVideoFrameCallback?.(() => {
+        if (state === s && s.frameFor === mv) s.frameOk = true;
+      });
+    }
+    if (s.frameOk) return true;
+    if (performance.now() - s.frameT0 > FRAME_WAIT_MS) return true;
+    if (!mv.requestVideoFrameCallback) {
+      return s.userPaused ? performance.now() - s.frameT0 > 150 : mv.currentTime !== s.frameCT;
+    }
+    return false;
   }
 
   // Returns true once the handoff is done.
   function tryHandoff() {
     if (!isWatch()) return false;
+    const s = state;
     const pl = mainPlayer();
     const mv = pl?.querySelector('video.html5-main-video');
-    if (!pl || !mv || mv === state.v) return false;
+    if (!pl || !mv || mv === s.v) return false;
 
     // Keep the real player quiet so you don't get double audio during the gap.
-    if (!state.mutedMain && pl.mute) {
-      state.mainWasMuted = !!pl.isMuted?.();
+    if (!s.mutedMain && pl.mute) {
+      s.mainWasMuted = !!pl.isMuted?.();
       pl.mute();
-      state.mutedMain = true;
+      s.mutedMain = true;
     }
+    // Paused on the preview -> keep the real player paused too.
+    if (s.userPaused && !mv.paused) pl.pauseVideo?.();
 
     if (pl.classList.contains('ad-showing')) return false;
-    if (mv.readyState < 3) return false;
+    if (mv.readyState < (s.userPaused ? 2 : 3)) return false;
 
-    const target = state.v.currentTime;
+    const target = s.v.currentTime;
 
     if (Math.abs(mv.currentTime - target) > SYNC_TOLERANCE) {
-      if (performance.now() - state.seekAt > 1200) {
+      if (performance.now() - s.seekAt > 1200) {
         log('seeking main to', target);
-        pl.seekTo(target + 0.15, true);
-        state.seekAt = performance.now();
+        pl.seekTo(target + (s.userPaused ? 0 : 0.15), true);
+        s.seekAt = performance.now();
+        s.frameFor = null;
       }
       return false;
     }
 
-    if (mv.paused) {
+    if (!s.userPaused && mv.paused) {
       pl.playVideo?.();
       return false;
     }
 
-    log('handoff at', mv.currentTime);
+    if (!frameShown(mv)) return false;
+
+    log('handoff at', mv.currentTime, s.userPaused ? '(paused)' : '');
     finish();
     return true;
   }
 
   function finish() {
     const s = state;
+    MUTED.set.call(s.v, true);
     if (s.mutedMain && !s.mainWasMuted) mainPlayer()?.unMute?.();
     s.mutedMain = false;
+    s.box.style.pointerEvents = 'none'; // clicks go to the real player from here on
     s.box.style.transition = 'opacity .15s';
     s.box.style.opacity = '0';
     setTimeout(() => { if (state === s) cleanup(); }, 160);
@@ -307,6 +458,15 @@
   document.addEventListener('click', (e) => {
     if (bypass) return;
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+
+    // Click on our overlay = play/pause, like the real player.
+    if (state && state.box.contains(e.target)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      togglePause();
+      return;
+    }
+
     if (e.target.closest?.('button, [role="button"], .ytp-button, yt-icon-button')) return;
 
     // Preview already playing: hand it off and let the click navigate normally.
@@ -335,6 +495,16 @@
     waitForPreview(a, e.clientX, e.clientY);
   }, true); // capture phase: grab it before YouTube reacts to the click
 
+  // Space / K while the overlay is up = play/pause, like the real player.
+  document.addEventListener('keydown', (e) => {
+    if (!state || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key !== ' ' && e.key !== 'k' && e.key !== 'K') return;
+    if (e.target.closest?.('input, textarea, [contenteditable=""], [contenteditable="true"]')) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    togglePause();
+  }, true);
+
   document.addEventListener('yt-navigate-start', () => {
     if (pending) clearPending(); // navigated some other way, drop the wait
     if (!state) return;
@@ -342,6 +512,7 @@
     state.navigated = true;
     state.navAt = performance.now();
     clearTimeout(state.revertTimer);
+    upgradeQuality(state.api); // again, in case the levels weren't known yet at click time
   });
 
   document.addEventListener('yt-navigate-finish', () => {
